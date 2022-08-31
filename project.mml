@@ -2,11 +2,13 @@ scale: 1
 metatile: 2
 name: OpenStreetMap Carto
 description: A general-purpose OpenStreetMap mapnik style, in CartoCSS
+font-directory: /carto/fonts
+# Changed bounds to wgs84
 bounds: &world
   - -180
-  - -85.05112877980659
+  - -90
   - 180
-  - 85.05112877980659
+  - 90
 center:
   - 0
   - 0
@@ -15,21 +17,25 @@ format: png
 interactivity: false
 minzoom: 0
 maxzoom: 22
-srs: "+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0.0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs +over"
+# changed SRS to wgs84 from mercator
+srs: "+proj=longlat +datum=WGS84 +no_defs +type=crs"
+# srs: "+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0.0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs +over"
 
 # Various parts to be included later on
 _parts:
   # Extents are used for tilemill, and don't actually make it to the generated XML
   extents: &extents
     extent: *world
-    srs-name: "900913"
-    srs: "+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0.0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs +over"
+    srs-name: "4326"
+    srs: "+proj=longlat +datum=WGS84 +no_defs +type=crs"
+    # srs: "+proj=merc +a=6378137 +b=6378137 +lat_ts=0.0 +lon_0=0.0 +x_0=0.0 +y_0=0.0 +k=1.0 +units=m +nadgrids=@null +wktext +no_defs +over"
   osm2pgsql: &osm2pgsql
+    # removed database options so we can set them as environment variables
     type: "postgis"
-    dbname: flex
     key_field: ""
     geometry_field: "way"
-    extent: "-20037508,-20037508,20037508,20037508"
+    srid: 4326
+    extent: "-180,-90,180,90"
 
 Stylesheet:
   - style/style.mss
@@ -1060,12 +1066,18 @@ Layer:
     Datasource:
       <<: *osm2pgsql
       table: |-
+        -- Added countries from NE imported data
         (SELECT
             ST_LineMerge(ST_Collect(way)) AS way,
             admin_level
-          FROM planet_osm_admin
+          FROM (SELECT way, admin_level FROM planet_osm_admin
           WHERE admin_level BETWEEN 0 AND 4
             AND way && !bbox!
+            UNION
+            SELECT way, 2 as admin_level
+            FROM ne_10m_admin_0_boundary_lines_land
+            WHERE way && !bbox!
+            ) all_ways
           GROUP BY admin_level
           ORDER BY admin_level DESC
         ) AS admin_low_zoom
@@ -1179,10 +1191,12 @@ Layer:
     Datasource:
       <<: *osm2pgsql
       table: |-
+        -- Added country names from imported NE countries layer
         (SELECT
             ST_PointOnSurface(way) AS way,
             way_area/NULLIF(POW(!scale_denominator!*0.001*0.28,2),0) AS way_pixels,
             name
+          FROM (SELECT ST_PointOnSurface(way) AS way, way_area, name
           FROM planet_osm_polygon
           WHERE ST_PointOnSurface(way) && !bbox!
             AND name IS NOT NULL
@@ -1191,6 +1205,17 @@ Layer:
             AND way_area > 100*POW(!scale_denominator!*0.001*0.28,2)
             AND way_area < 4000000*POW(!scale_denominator!*0.001*0.28,2)
             AND osm_id < 0
+            UNION ALL
+          SELECT ST_PointOnSurface(way) AS way, way_area, name
+            FROM (SELECT ST_Union(way) AS way, ST_Area(ST_Union(way),true) AS way_area, name_he as name
+                  FROM ne_10m_admin_0_countries_isr 
+                  WHERE ST_PointOnSurface(way) && !bbox!
+                  AND name_he IS NOT NULL
+                  group by name_he
+                  ) a
+            WHERE way_area > 100*POW(!scale_denominator!*0.001*0.28,2)
+            AND way_area < 4000000*POW(!scale_denominator!*0.001*0.28,2)
+            ) all_countries
           ORDER BY way_area DESC
         ) AS country_names
     properties:
@@ -1201,7 +1226,13 @@ Layer:
     Datasource:
       <<: *osm2pgsql
       table: |-
+        -- Added capitals from NE
         (SELECT
+            way,
+            name,
+            population,
+            dir
+          FROM (SELECT
             way,
             name,
             CASE
@@ -1212,7 +1243,18 @@ Layer:
           WHERE place IN ('city', 'town', 'village', 'hamlet')
             AND name IS NOT NULL
             AND tags @> 'capital=>yes'
-          ORDER BY population DESC
+          UNION ALL
+          SELECT 
+            way, 
+            name_he AS name,
+            CASE
+              WHEN (pop_max::text ~ '^[0-9]{1,8}$') THEN (pop_max)::INTEGER ELSE 0
+            END as population,
+            round(ascii(md5(nameascii::text)) / 55) AS dir
+            FROM ne_10m_populated_places
+            WHERE adm0cap = 1
+
+          ) capitals ORDER BY population DESC
         ) AS capital_names
     properties:
       minzoom: 3
@@ -1279,6 +1321,23 @@ Layer:
               WHERE place IN ('city', 'town')
                 AND name IS NOT NULL
                 AND NOT (tags @> 'capital=>yes')
+              UNION
+              SELECT 
+                pop_max AS osm_id, 
+                way,
+                'city' AS place, 
+                name_he AS name, 
+                (pop_max
+                *
+                  (CASE
+                  WHEN name like '%capital%' THEN 2
+                  ELSE 1
+                  END)
+                ) AS score
+                FROM public.ne_10m_populated_places
+                WHERE adm0cap = 0
+                AND pop_max > 100000
+                AND featurecla NOT IN ('Scientific station', 'Historic place', 'Meteorological Station')
             ) as p
           ORDER BY score DESC, length(name) DESC, name
         ) AS placenames_medium
